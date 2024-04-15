@@ -5,44 +5,68 @@
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
+#include <ESPAsyncWiFiManager.h>
 
 #define PWM_OUT_PIN 32
 #define PWM_OUT_PIN_2 33
+#define ONOFF_INPUT_PIN 14
 
+char uniqueChipID[18];
+const char* configNameChar;
+unsigned long lastDiscoveryTime = 0;
+const unsigned long discoveryInterval = 10000;
 int currentHour;
 int currentMinute;
 int currentSecond;
 
 int pwmValue = 0;
 int pwmValue2 = 0;
-bool onOffState = 1;
+int pwmValueAuto = 0;
+int pwmValueAuto2 = 0;
+
+
+
+bool btnState = true;
+bool onOffState = 0;
 bool modoAutomaticoState = 1;
-int selectedHour = 0;
+int selectedHour = 8;
+int prevSelectedHour = 0;
+
+const int UDP_PORT = 80123;
 
 WiFiUDP ntpUDP;
+WiFiUDP udp;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 60 * 60);
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+DNSServer dns;
+AsyncWiFiManager wifiManager(&server, &dns);
 
-void connectToWiFi() {
-  WiFi.begin("Elements", "Elements@@2024!");
-  int attempt = 0;
 
-  while (WiFi.status() != WL_CONNECTED && attempt < 10) {
-    delay(500);
-    Serial.println("Tentando conectar ao WiFi principal...");
-    attempt++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Conectado ao WiFi principal!");
-    Serial.println("IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("Falha ao conectar ao WiFi principal.");
-  }
+void convertToHexString(uint8_t *bytes, char *hexString, int length) {
+    for (int i = 0; i < length; i++) {
+        sprintf(hexString + i * 2, "%02X", bytes[i]);
+    }
 }
 
+void discoveryUDP() {
+    unsigned long currentTime = millis();
+    if (currentTime - lastDiscoveryTime >= discoveryInterval) {
+        lastDiscoveryTime = currentTime;
+        
+        // Criar a mensagem de descoberta
+        String discoveryMessage = "Solare";
+        discoveryMessage += uniqueChipID;
+
+        // Enviar a mensagem para todos os dispositivos na rede
+        udp.beginPacket(IPAddress(255, 255, 255, 255), 8123); // IP de broadcast e porta
+        udp.print(discoveryMessage);
+        udp.endPacket();
+
+        Serial.println("Mensagem de descoberta enviada");
+    }
+}
 void actionLed() {
   timeClient.update();
   currentHour = timeClient.getHours();
@@ -50,6 +74,16 @@ void actionLed() {
   currentSecond = timeClient.getSeconds();
   ledcWrite(0, pwmValue);
   ledcWrite(1, pwmValue2);
+}
+
+void sendMessageToClients() {
+    DynamicJsonDocument jsonDoc(256);
+    jsonDoc["onOffState"] = onOffState;
+    jsonDoc["modoAutomaticoState"] = modoAutomaticoState;
+    jsonDoc["selectedHour"] = selectedHour;
+    String jsonData;
+    serializeJson(jsonDoc, jsonData);
+    ws.textAll(jsonData);
 }
 
 void handleWebSocketMessage(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t * data, size_t len) {
@@ -75,6 +109,8 @@ void handleWebSocketMessage(AsyncWebSocket * server, AsyncWebSocketClient * clie
     Serial.print("selectedHour atualizado para: ");
     Serial.println(selectedHour);
   }
+
+  sendMessageToClients();
 }
 
 
@@ -125,7 +161,7 @@ void handleRoot(AsyncWebServerRequest *request) {
     html += "<button onclick='setLight(16)'>16:00hrs</button>";
     html += "<button onclick='setLight(18)'>18:00hrs</button>";
     html += "</div>";
-    html += "<img class='responsive-image' src='https://dcuatro.com/wp-content/uploads/2020/08/Articulo_alejandro_imagen.jpg' alt='Imagem'>";
+    //html += "<img class='responsive-image' src='https://dcuatro.com/wp-content/uploads/2020/08/Articulo_alejandro_imagen.jpg' alt='Imagem'>";
     html += "</div>";
     html += "<div class='NT-footer-icones'>";
     // Restante do código para os ícones
@@ -170,9 +206,26 @@ request->send(200, "text/html", html);
 }
 
 
+
 void setup() {
-  WiFi.setHostname("luminaria-elements");
+
+   // Obtém o número de série do chip ESP32
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+   
+    convertToHexString(mac + 3, uniqueChipID, 3); // Use os últimos 3 bytes do endereço MAC como ID de chip único
+    Serial.print("Unique Chip ID: ");
+    Serial.println(uniqueChipID);
+  String configName = "Solare";
+  configName += uniqueChipID;
+
+  configNameChar = configName.c_str();
+
+  WiFi.setHostname(configNameChar);
+  
   Serial.begin(115200);
+  pinMode(ONOFF_INPUT_PIN, INPUT_PULLUP);
+  digitalWrite(ONOFF_INPUT_PIN,HIGH);
   pinMode(PWM_OUT_PIN, OUTPUT);
   pinMode(PWM_OUT_PIN_2, OUTPUT);
   ledcAttachPin(PWM_OUT_PIN, 0);
@@ -180,8 +233,74 @@ void setup() {
   ledcSetup(0, 12000, 10);
   ledcSetup(1, 12000, 10);
   
-  connectToWiFi();
 
+
+    
+
+  // Inicia o WiFi em modo estação (station mode)
+  WiFi.mode(WIFI_STA);
+  
+
+  byte countReset = 0;  
+  if(digitalRead(ONOFF_INPUT_PIN) == LOW){
+    Serial.println("Entrando em modo de reset");
+    for(int i = 1; i <= 5; i++){
+      ledcWrite(0, 255);
+      ledcWrite(1, 255);
+      delay(1000);
+      ledcWrite(0, 0);
+      ledcWrite(1, 0);
+      delay(1000);
+      countReset = i;
+    }
+  }
+  if(countReset == 5 && digitalRead(ONOFF_INPUT_PIN) == LOW){
+      for(int i = 1; i <= 5; i++){
+      ledcWrite(0, 255);
+      ledcWrite(1, 255);
+      delay(300);
+      ledcWrite(0, 0);
+      ledcWrite(1, 0);
+      delay(300);
+    }
+      Serial.println("Configurações de wifi resetadas");
+      WiFi.disconnect(true, true);
+      delay(1000);
+      countReset = 0;
+  }
+ 
+
+  // Verifica se as credenciais de WiFi foram salvas
+ 
+ 
+  if (!wifiManager.autoConnect(configNameChar)) {
+    // Se não conseguir se conectar, inicia o modo de ponto de acesso (AP) e inicia o portal de configuração
+    Serial.println("Falha ao conectar-se ao WiFi. Iniciando modo de ponto de acesso...");
+    
+    // Configura o modo de ponto de acesso
+    WiFi.mode(WIFI_AP);
+    
+    // Inicia o servidor DNS
+    dns.start(53, "*", WiFi.softAPIP());
+
+    
+
+    // Inicia o servidor web para configuração de WiFi
+    server.begin();
+    Serial.println("Portal de configuração iniciado. Conecte-se à rede 'LuminariaAP' para configurar o WiFi.");
+  } else {
+    
+    Serial.print("Conectado à rede: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("IP: ");
+    Serial.print(WiFi.localIP());
+    Serial.print(" | Hostname: ");
+    Serial.println(WiFi.getHostname());
+   
+    udp.begin(UDP_PORT);
+  }
+
+     
   // Configuração do WebSocket
   ws.onEvent(handleWebSocketMessage);
   server.addHandler(&ws);
@@ -204,44 +323,139 @@ void setup() {
 
   // Handler para a raiz da página
   server.on("/", HTTP_GET, handleRoot);
+  
 }
 
 
 void loop() {
 
+  if(digitalRead(ONOFF_INPUT_PIN) == LOW && btnState == true){
+    onOffState = !onOffState;
+    btnState = false;
+    delay(100);
+  }
+  if(digitalRead(ONOFF_INPUT_PIN) == HIGH){
+    btnState = true;
+    delay(100);
+  }
+ discoveryUDP();
+
    // Verifica se as variáveis foram alteradas
   static bool prevOnOffState = false;
   static bool prevModoAutomaticoState = false;
 
-  if (onOffState != prevOnOffState || modoAutomaticoState != prevModoAutomaticoState) {
+  if (onOffState != prevOnOffState || modoAutomaticoState != prevModoAutomaticoState || selectedHour != prevSelectedHour) {
     // Atualiza as variáveis de estado anterior
     prevOnOffState = onOffState;
     prevModoAutomaticoState = modoAutomaticoState;
+    prevSelectedHour = selectedHour;
 
     // Cria e envia a mensagem WebSocket para informar o cliente sobre a mudança
     DynamicJsonDocument jsonDoc(128);
     jsonDoc["onOffState"] = onOffState;
     jsonDoc["modoAutomaticoState"] = modoAutomaticoState;
+    jsonDoc["selectedHour"] = selectedHour;
     String jsonData;
     serializeJson(jsonDoc, jsonData);
     ws.textAll(jsonData);
   }
   
-  if (onOffState) {
-    pwmValue = 255;
-  } else {
+  
+  if (onOffState == false) {
     pwmValue = 0;
     pwmValue2 = 0;
-  }
+  }else if (onOffState == true && modoAutomaticoState == false) {
+    switch(selectedHour){
+      case 8 :
+        pwmValue = 255;
+        pwmValue2 = 0;
+      break;  
 
-  if (modoAutomaticoState) {
-    pwmValue2 = 255;
+      case 10 :
+        pwmValue = 127;
+        pwmValue2 = 127;
+      break;
+
+      case 12 :
+        pwmValue = 255;
+        pwmValue2 = 255;
+      break;
+
+      case 14 :
+        pwmValue = 127;
+        pwmValue2 = 127;
+      break;
+
+      case 16 :
+        pwmValue = 255;
+        pwmValue2 = 127;
+      break;
+
+      case 18 :
+        pwmValue = 255;
+        pwmValue2 = 0;
+      break;
+    }
+  } 
+
+  if (onOffState == true && modoAutomaticoState == true) {
+    if(currentHour >= 19 && currentHour <= 23 || currentHour >= 0 && currentHour <= 7)
+     {
+      pwmValue = 255;
+      pwmValue2 = 0;
+     }
+
+    switch (currentHour)
+    {
+    case 8:
+      pwmValue = 255;
+      pwmValue2 = 0;
+      break;
+    case 9:
+      pwmValue = 205;
+      pwmValue2 = 55;
+      break;
+    case 10:
+      pwmValue = 155;
+      pwmValue2 = 105;
+      break;
+    case 11:
+      pwmValue = 105;
+      pwmValue2 = 155;
+      break;
+    case 12:
+      pwmValue = 55;
+      pwmValue2 = 225;
+      break;
+    case 13:
+      pwmValue = 0;
+      pwmValue2 = 255;
+      break;
+    case 14:
+      pwmValue = 55;
+      pwmValue2 = 205;
+      break;
+    case 15:
+      pwmValue = 105;
+      pwmValue2 = 155;
+      break;
+    case 16:
+      pwmValue = 155;
+      pwmValue2 = 105;
+      break;              
+    case 17:
+      pwmValue = 205;
+      pwmValue2 = 55;
+      break;
+    case 18:
+      pwmValue = 255;
+      pwmValue2 = 0;
+      break;  
+    
+    }
   } else {
-    pwmValue = 0;
-    pwmValue2 = 0;
+    
   }
   actionLed();
-   //Serial.print("ON/OFF State: " + String(onOffState));
-  //Serial.print("  -  Modo Automático State: " + String(modoAutomaticoState));
-  //Serial.println(" -  Selected Hour: " + String(selectedHour));
+  
 }
